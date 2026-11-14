@@ -6,9 +6,6 @@ const CASES: &[&[&str]] = &[
     &["ci", "plan"],
     &["ci", "--snapshot", "commit", "--ref", "HEAD"],
     &["exec", "--in-place", "--", "true"],
-    &["submit", "--", "true"],
-    &["ls"],
-    &["show", "x"],
     &["logs", "x", "--follow"],
     &["wait", "x"],
     &["cancel", "x"],
@@ -51,7 +48,7 @@ fn every_command_reports_not_implemented_as_json() {
 fn without_json_stdout_is_empty_and_error_goes_to_stderr() {
     let out = Command::cargo_bin("remote-task-runner")
         .unwrap()
-        .arg("ls")
+        .arg("init")
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(70));

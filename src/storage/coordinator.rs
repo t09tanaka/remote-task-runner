@@ -19,6 +19,7 @@ use serde_json::Value;
 use std::path::Path;
 
 mod collect;
+pub mod query;
 mod queue;
 pub use collect::{Collectable, CollectionRow, ResultRef, RunStanding};
 pub use queue::{LiveAttempt, PlaceInput, PlaceOutcome, QueuedTask, RetireEnd, Seen, WorkerLoad};

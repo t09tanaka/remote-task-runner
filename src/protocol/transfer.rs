@@ -47,6 +47,10 @@ pub enum TransferError {
     /// The peer announced a size other than the one the caller knows.
     #[error("blob size is {actual}, expected {expected}")]
     SizeMismatch { expected: u64, actual: u64 },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    ReaderTask(#[from] tokio::task::JoinError),
 }
 
 /// Send `data` as blob `source_id`, starting at offset `start` (what a previous
@@ -124,6 +128,107 @@ pub async fn put_blob_as(
             }
         }
         highest = highest.max(resp.received.min(total_size));
+        if resp.received > offset {
+            stalls = 0;
+        } else {
+            stalls += 1;
+            if stalls > MAX_STALLS {
+                return Err(TransferError::Stalled);
+            }
+        }
+        offset = resp.received.min(total_size);
+    }
+}
+
+/// Maximum allocation/read request of a file-backed upload, independent of file size.
+pub const UPLOAD_READ_BYTES: usize = 64 * 1024;
+
+/// Send a seekable reader with the already verified digest and exact size.
+/// Disk seek/read happens on blocking threads. The receiver's offset may move
+/// backwards or ahead, exactly as with `put_blob_as`; each read is bounded.
+/// The receiver verifies the original digest, so changed bytes cannot publish.
+#[allow(clippy::too_many_arguments)]
+pub async fn put_blob_reader_as<R: std::io::Read + std::io::Seek + Send + 'static>(
+    client: &Client,
+    coordinator_epoch: CoordinatorEpoch,
+    source_id: &SourceId,
+    kind: SourceBlobKind,
+    mut reader: R,
+    digest: Digest,
+    total_size: u64,
+    start: u64,
+    chunk_bytes: usize,
+    timeout: Duration,
+) -> Result<BlobPutResponse, TransferError> {
+    let chunk_bytes = chunk_bytes.clamp(1, UPLOAD_READ_BYTES);
+    let mut offset = start.min(total_size);
+    let mut stalls = 0;
+    let mut regressions = 0;
+    loop {
+        let (returned, data) = tokio::task::spawn_blocking(move || -> Result<_, TransferError> {
+            use std::io::SeekFrom;
+            let size = reader.seek(SeekFrom::End(0))?;
+            if size != total_size {
+                return Err(TransferError::SizeMismatch {
+                    expected: total_size,
+                    actual: size,
+                });
+            }
+            reader.seek(SeekFrom::Start(offset))?;
+            let count = (total_size - offset).min(chunk_bytes as u64) as usize;
+            let mut data = vec![0; count];
+            reader.read_exact(&mut data)?;
+            let size = reader.seek(SeekFrom::End(0))?;
+            if size != total_size {
+                return Err(TransferError::SizeMismatch {
+                    expected: total_size,
+                    actual: size,
+                });
+            }
+            Ok((reader, data))
+        })
+        .await??;
+        reader = returned;
+        let request = Request::BlobPut(BlobPutRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            coordinator_epoch,
+            source_id: source_id.clone(),
+            kind,
+            digest: digest.clone(),
+            total_size,
+            offset,
+            data: Bytes(data),
+        });
+        let Response::BlobPut(resp) = client.call(request, timeout).await? else {
+            return Err(TransferError::Unexpected(
+                "blob_put answered with another operation",
+            ));
+        };
+        if resp.digest != digest {
+            return Err(TransferError::Unexpected(
+                "blob_put answered for another digest",
+            ));
+        }
+        if resp.complete {
+            if resp.received != total_size {
+                return Err(TransferError::Unexpected(
+                    "blob_put completed at another size",
+                ));
+            }
+            return Ok(resp);
+        }
+        if resp.received > total_size {
+            return Err(TransferError::Unexpected(
+                "blob_put offset exceeds total size",
+            ));
+        }
+        if resp.received < offset {
+            regressions += 1;
+            if regressions > MAX_REGRESSIONS {
+                return Err(TransferError::Stalled);
+            }
+        }
         if resp.received > offset {
             stalls = 0;
         } else {

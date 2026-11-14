@@ -16,8 +16,8 @@ use local_ci::ExecContext;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// What a peer's store holds: the question a transfer plan asks of it.
@@ -343,6 +343,14 @@ fn corrupt(what: impl Into<String>) -> anyhow::Error {
     SourceError::Corrupt { what: what.into() }.into()
 }
 
+/// Verified descriptor and immutable transfer identity. Hashing never holds the
+/// object or bundle in memory; callers must run this synchronous IO off executor threads.
+pub struct UploadFile {
+    pub file: std::fs::File,
+    pub digest: crate::ids::Digest,
+    pub size: u64,
+}
+
 impl SourceStore {
     /// `<state_dir>/sources`, private to this user.
     pub fn open(state_dir: &Path) -> Result<Self> {
@@ -436,6 +444,60 @@ impl SourceStore {
             blobs: missing_blobs(&entries, |h| peer.has_blob(h)),
             manifests,
         })
+    }
+
+    /// Open a captured object without following links, verify SHA-256 with
+    /// bounded reads, then rewind the same descriptor for upload.
+    pub fn open_blob_verified(&self, hash: &str) -> Result<UploadFile> {
+        anyhow::ensure!(is_blob_hash(hash), "invalid source blob hash");
+        let file = self.open_upload_file(&["objects", &hash[..2]], hash)?;
+        let upload = verify_upload_file(file)?;
+        anyhow::ensure!(
+            upload.digest == crate::ids::Digest::parse(&format!("sha256:{hash}"))?,
+            "source blob digest mismatch"
+        );
+        Ok(upload)
+    }
+    /// Open only an export in this store's private bundles directory.
+    pub fn open_bundle_verified(&self, path: &Path) -> Result<UploadFile> {
+        anyhow::ensure!(
+            path.parent() == Some(self.root().join("bundles").as_path()),
+            "bundle is outside the source store"
+        );
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| corrupt("invalid bundle filename"))?;
+        anyhow::ensure!(name.ends_with(".bundle"), "invalid bundle filename");
+        verify_upload_file(self.open_upload_file(&["bundles"], name)?)
+    }
+    fn open_upload_file(&self, dirs: &[&str], name: &str) -> Result<std::fs::File> {
+        use rustix::fs::{open, openat, Mode, OFlags};
+        let directory = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut dir: std::fs::File = open(self.root(), directory, Mode::empty())?.into();
+        let root = dir.metadata()?;
+        anyhow::ensure!(
+            root.uid() == rustix::process::geteuid().as_raw() && root.mode() & 0o077 == 0,
+            "unsafe source store directory"
+        );
+        for component in dirs {
+            dir = openat(&dir, *component, directory, Mode::empty())?.into();
+        }
+        let file: std::fs::File = openat(
+            &dir,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into();
+        let meta = file.metadata()?;
+        anyhow::ensure!(
+            meta.is_file()
+                && meta.nlink() == 1
+                && meta.uid() == rustix::process::geteuid().as_raw(),
+            "unsafe source upload file"
+        );
+        Ok(file)
     }
 
     /// The bytes of a blob, to send.
@@ -872,6 +934,45 @@ pub struct RequestSummary {
     pub base: Option<String>,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
+}
+
+fn verify_upload_file(mut file: std::fs::File) -> Result<UploadFile> {
+    let before = file.metadata()?;
+    let mut hasher = Sha256::new();
+    let mut count = 0u64;
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        count = count
+            .checked_add(n as u64)
+            .ok_or_else(|| corrupt("upload size overflow"))?;
+        anyhow::ensure!(count <= before.len(), "source upload grew while hashing");
+        hasher.update(&buffer[..n]);
+    }
+    let after = file.metadata()?;
+    anyhow::ensure!(
+        count == before.len()
+            && after.len() == before.len()
+            && after.mtime() == before.mtime()
+            && after.mtime_nsec() == before.mtime_nsec()
+            && after.ctime() == before.ctime()
+            && after.ctime_nsec() == before.ctime_nsec(),
+        "source upload changed while hashing"
+    );
+    let hash: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    file.seek(SeekFrom::Start(0))?;
+    Ok(UploadFile {
+        file,
+        digest: crate::ids::Digest::parse(&format!("sha256:{hash}"))?,
+        size: count,
+    })
 }
 
 /// A manifest from outside is not taken for what it says: its schema, its

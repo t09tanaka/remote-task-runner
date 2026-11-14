@@ -1135,3 +1135,237 @@ async fn an_answer_that_cannot_be_read_is_unconfirmed_and_not_the_peers_refusal(
         );
     }
 }
+
+struct BoundedUploadReader {
+    inner: std::io::Cursor<Vec<u8>>,
+    executor: std::thread::ThreadId,
+    reads: Arc<Mutex<Vec<usize>>>,
+}
+impl std::io::Read for BoundedUploadReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        assert_ne!(
+            std::thread::current().id(),
+            self.executor,
+            "upload blocked executor"
+        );
+        assert!(buf.len() <= 64 * 1024, "unbounded upload read");
+        self.reads.lock().unwrap().push(buf.len());
+        std::io::Read::read(&mut self.inner, buf)
+    }
+}
+impl std::io::Seek for BoundedUploadReader {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        assert_ne!(
+            std::thread::current().id(),
+            self.executor,
+            "upload seek blocked executor"
+        );
+        std::io::Seek::seek(&mut self.inner, from)
+    }
+}
+#[tokio::test]
+async fn streamed_upload_is_bounded_off_executor_and_follows_receiver_offsets() {
+    use remote_task_runner::protocol::transfer::put_blob_reader_as;
+    let data = pseudo_random(3 * 64 * 1024 + 17);
+    let digest = Digest::of_bytes(&data);
+    let source = SourceId::generate();
+    let cluster = ClusterId::generate();
+    for script in [vec![], vec![100, 0]] {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let reader = BoundedUploadReader {
+            inner: std::io::Cursor::new(data.clone()),
+            executor: std::thread::current().id(),
+            reads: reads.clone(),
+        };
+        let (conn, srv) = pair(&cluster).await;
+        serve(
+            srv.incoming,
+            scripted_put_worker(script, Arc::new(Mutex::new(None))),
+        );
+        let done = put_blob_reader_as(
+            &conn.client,
+            CoordinatorEpoch(1),
+            &source,
+            SourceBlobKind::Content,
+            reader,
+            digest.clone(),
+            data.len() as u64,
+            0,
+            usize::MAX,
+            T,
+        )
+        .await
+        .unwrap();
+        assert!(done.complete);
+        assert_eq!(done.received, data.len() as u64);
+        assert!(reads.lock().unwrap().len() >= 4);
+    }
+    // A fresh connection may start ahead of the receiver, which requests offset zero.
+    let (conn, srv) = pair(&cluster).await;
+    serve(srv.incoming, blob_worker(Arc::new(Mutex::new(None))));
+    assert!(
+        put_blob_reader_as(
+            &conn.client,
+            CoordinatorEpoch(1),
+            &source,
+            SourceBlobKind::Bundle,
+            std::io::Cursor::new(data.clone()),
+            digest,
+            data.len() as u64,
+            99999,
+            4096,
+            T
+        )
+        .await
+        .unwrap()
+        .complete
+    );
+}
+#[tokio::test]
+async fn streamed_upload_empty_stall_regression_and_changed_bytes_are_checked() {
+    use remote_task_runner::protocol::transfer::put_blob_reader_as;
+    let cluster = ClusterId::generate();
+    let source = SourceId::generate();
+    let (conn, srv) = pair(&cluster).await;
+    serve(srv.incoming, blob_worker(Arc::new(Mutex::new(None))));
+    assert!(
+        put_blob_reader_as(
+            &conn.client,
+            CoordinatorEpoch(1),
+            &source,
+            SourceBlobKind::Content,
+            std::io::Cursor::new(Vec::new()),
+            Digest::of_bytes(b""),
+            0,
+            u64::MAX,
+            0,
+            T
+        )
+        .await
+        .unwrap()
+        .complete
+    );
+    for script in [vec![0; 10], (1..20).flat_map(|i| [i * 10, 0]).collect()] {
+        let (conn, srv) = pair(&cluster).await;
+        serve(
+            srv.incoming,
+            scripted_put_worker(script, Arc::new(Mutex::new(None))),
+        );
+        let err = put_blob_reader_as(
+            &conn.client,
+            CoordinatorEpoch(1),
+            &source,
+            SourceBlobKind::Content,
+            std::io::Cursor::new(vec![7; 1000]),
+            Digest::of_bytes(&vec![7; 1000]),
+            1000,
+            0,
+            100,
+            T,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, TransferError::Stalled), "{err:?}");
+    }
+    let (conn, srv) = pair(&cluster).await;
+    serve(srv.incoming, blob_worker(Arc::new(Mutex::new(None))));
+    let err = put_blob_reader_as(
+        &conn.client,
+        CoordinatorEpoch(1),
+        &source,
+        SourceBlobKind::Content,
+        std::io::Cursor::new(b"changed!".to_vec()),
+        Digest::of_bytes(b"original"),
+        8,
+        0,
+        4,
+        T,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, TransferError::Call(CallError::Remote(_))),
+        "{err:?}"
+    );
+    let (conn, _srv) = pair(&cluster).await;
+    let err = put_blob_reader_as(
+        &conn.client,
+        CoordinatorEpoch(1),
+        &source,
+        SourceBlobKind::Content,
+        std::io::Cursor::new(b"grown".to_vec()),
+        Digest::of_bytes(b"orig"),
+        4,
+        0,
+        4,
+        T,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        TransferError::SizeMismatch {
+            expected: 4,
+            actual: 5
+        }
+    ));
+}
+
+#[tokio::test]
+async fn streamed_upload_detects_file_mutation_between_chunks() {
+    use remote_task_runner::protocol::transfer::put_blob_reader_as;
+    use std::io::{Seek, SeekFrom, Write};
+    use std::os::unix::fs::FileExt;
+    for grows in [false, true] {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"abcdefgh").unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let change = file.try_clone().unwrap();
+        let honest = blob_worker(Arc::new(Mutex::new(None)));
+        let handler: Handler = Arc::new(move |request| {
+            let first = matches!(&request,Request::BlobPut(r) if r.offset==0);
+            let response = honest(request);
+            if first {
+                if grows {
+                    change.set_len(9).unwrap();
+                } else {
+                    assert_eq!(change.write_at(b"WXYZ", 4).unwrap(), 4);
+                }
+            }
+            response
+        });
+        let (conn, srv) = pair(&ClusterId::generate()).await;
+        serve(srv.incoming, handler);
+        let err = put_blob_reader_as(
+            &conn.client,
+            CoordinatorEpoch(1),
+            &SourceId::generate(),
+            SourceBlobKind::Content,
+            file,
+            Digest::of_bytes(b"abcdefgh"),
+            8,
+            0,
+            4,
+            T,
+        )
+        .await
+        .unwrap_err();
+        if grows {
+            assert!(
+                matches!(
+                    err,
+                    TransferError::SizeMismatch {
+                        expected: 8,
+                        actual: 9
+                    }
+                ),
+                "{err:?}"
+            );
+        } else {
+            assert!(
+                matches!(err, TransferError::Call(CallError::Remote(_))),
+                "changed bytes were accepted: {err:?}"
+            );
+        }
+    }
+}

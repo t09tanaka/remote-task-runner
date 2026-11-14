@@ -224,6 +224,8 @@ pub struct Agent {
     /// One new acceptance at a time: the live cap and the insert are one step.
     submitting: Mutex<()>,
     ticking: AtomicBool,
+    /// Directory enumeration continues across bounded terminal cleanup passes.
+    cleanup_scan: Mutex<Option<fs::ReadDir>>,
 }
 
 /// A point in the agent's work a test may stop at. See [`Agent::set_probe`].
@@ -501,12 +503,13 @@ impl Agent {
             noted: Mutex::default(),
             submitting: Mutex::default(),
             ticking: AtomicBool::new(false),
+            cleanup_scan: Mutex::new(None),
         });
         for a in todo {
             agent.kick(&a);
         }
         // Attempts that ended while no agent ran still hold a workspace.
-        agent.clean_ended();
+        agent.cleanup_terminal(32);
         Ok(agent)
     }
 
@@ -1339,6 +1342,19 @@ impl Agent {
     /// and the attempt's watcher both come here.
     fn clean(&self, attempt: &AttemptId) {
         let _one = lock(shard(&self.shards, attempt));
+        let pending = self.attempt_dir(attempt).join("cleanup-pending");
+        // Persist retry evidence before removing the last secret-bearing spec,
+        // including when there is no workspace record. A restart sees it too.
+        if self.attempt_dir(attempt).exists() && !pending.exists() {
+            if let Err(e) = write_atomic(&pending, b"") {
+                self.note_once(
+                    attempt,
+                    "agent_cleanup_failed",
+                    json!({ "message": e.to_string() }),
+                );
+                return;
+            }
+        }
         // First, and whatever becomes of the rest: the supervisor's spec
         // carries the secret values to mask. The attempt is terminal, so no
         // supervisor is started from it again (one that still runs has read
@@ -1361,6 +1377,7 @@ impl Agent {
         }
         match self.host.cleanup(attempt, ws.as_ref()) {
             Ok(()) => {
+                let _ = fs::remove_file(pending);
                 let _ = fs::remove_file(marker);
                 let _ = fs::remove_dir(self.attempt_dir(attempt));
                 lock(&self.clocks).remove(attempt.as_str());
@@ -1368,15 +1385,53 @@ impl Agent {
                 lock(&self.noted).retain(|k, _| !k.starts_with(&mine));
             }
             // Tried again at every tick; said once per distinct failure.
-            Err(e) => self.note_once(
-                attempt,
-                "agent_cleanup_failed",
-                json!({ "code": e.code, "message": e.message }),
-            ),
+            Err(e) => {
+                self.note_once(
+                    attempt,
+                    "agent_cleanup_failed",
+                    json!({ "code": e.code, "message": e.message }),
+                );
+            }
         }
     }
 
-    /// Clean every ended attempt that still has a workspace record.
+    /// Examine at most `limit` directory entries for terminal cleanup, without
+    /// deleting retained results, logs or artifacts. Enumeration resumes on the
+    /// next call; after EOF a later call starts a new scan, retrying failures.
+    /// Every entry counts, including invalid names and nonterminal attempts.
+    pub fn cleanup_terminal(&self, limit: usize) -> usize {
+        if limit == 0 {
+            return 0;
+        }
+        let mut scan = lock(&self.cleanup_scan);
+        if scan.is_none() {
+            *scan = fs::read_dir(self.cfg.attempts_root()).ok();
+        }
+        let mut examined = 0;
+        while examined < limit {
+            let Some(entry) = scan.as_mut().and_then(Iterator::next) else {
+                *scan = None;
+                break;
+            };
+            examined += 1;
+            let Ok(entry) = entry else { continue };
+            let Ok(a) = AttemptId::parse(&entry.file_name().to_string_lossy()) else {
+                continue;
+            };
+            if !self.workspace_path(&a).exists()
+                && !self.spec_path(&a).exists()
+                && !self.attempt_dir(&a).join("cleanup-pending").exists()
+            {
+                continue;
+            }
+            if matches!(self.store.get(&a), Ok(Some(r)) if r.state == AttemptState::Terminal) {
+                self.clean(&a);
+            }
+        }
+        examined
+    }
+
+    /// Clean every ended attempt that still has cleanup files.
     pub fn clean_ended(&self) {
         let Ok(rd) = fs::read_dir(self.cfg.attempts_root()) else {
             return;
@@ -1385,7 +1440,10 @@ impl Agent {
             let Ok(a) = AttemptId::parse(&ent.file_name().to_string_lossy()) else {
                 continue;
             };
-            if !self.workspace_path(&a).exists() {
+            if !self.workspace_path(&a).exists()
+                && !self.spec_path(&a).exists()
+                && !self.attempt_dir(&a).join("cleanup-pending").exists()
+            {
                 continue;
             }
             if matches!(self.store.get(&a), Ok(Some(r)) if r.state == AttemptState::Terminal) {
@@ -1422,14 +1480,15 @@ impl Agent {
         Ok(report)
     }
 
-    /// Supervise durable attempts without running retention or cleanup sweeps.
-    /// Resident composition uses this until bounded deletion is available.
+    /// Supervise durable attempts and retry bounded terminal cleanup.
+    /// Retention GC is deliberately separate.
     pub fn supervise(self: &Arc<Self>) {
         if self.ticking.swap(true, Ordering::SeqCst) {
             return;
         }
         let _pass = Ticking(&self.ticking);
         self.supervise_attempts();
+        self.cleanup_terminal(32);
     }
 
     fn supervise_attempts(self: &Arc<Self>) {

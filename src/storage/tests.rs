@@ -5,6 +5,7 @@ use crate::error::ErrorCode;
 use crate::ids::*;
 use crate::state::{Exit, Observation, Outcome, Receipt, Receipts};
 use crate::wire::LeaseKey;
+use rusqlite::OptionalExtension;
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -2984,7 +2985,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
     let all = schema::steps(DbKind::Coordinator);
     assert_eq!(
         all.len(),
-        3,
+        4,
         "this test is about step 1 and the steps after it"
     );
     let (cluster, coordinator) = (ClusterId::generate(), CoordinatorId::generate());
@@ -3097,7 +3098,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opened for writing, it is migrated, and every row is still there.
     let store = CoordinatorStore::open(dir.path(), 10).unwrap();
-    assert_eq!(schema_of(&store), ("3".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("4".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(4));
     assert_eq!(store.cluster_id(), &cluster);
     check_rows(&store);
@@ -3115,7 +3116,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opening again migrates nothing and loses nothing.
     let store = CoordinatorStore::open(dir.path(), 20).unwrap();
-    assert_eq!(schema_of(&store), ("3".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("4".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(5));
     assert_eq!(store.task_cancel_requested(&queued_task).unwrap(), Some(11));
     assert_eq!(store.live_attempts(None).unwrap().len(), 1);
@@ -3298,4 +3299,86 @@ fn a_retire_and_its_note_are_written_together_or_not_at_all() {
         .begin_retire_noting(&AttemptId::generate(), "cannot", None, 1)
         .unwrap_err();
     assert_eq!(e.code(), ErrorCode::NotFound);
+}
+
+#[test]
+fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
+    use super::policy::Access;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("coordinator.db");
+    let all = schema::steps(DbKind::Coordinator);
+    assert_eq!(all.len(), 4);
+    let cluster = ClusterId::generate();
+    let co = CoordinatorId::generate();
+    let run = RunId::generate();
+    let tasks = (0..3).map(|_| TaskId::generate()).collect::<Vec<_>>();
+    {
+        let old = db::open_with(
+            &path,
+            "coordinator",
+            &all[..3],
+            schema::compat(3),
+            Access::ReadWrite,
+        )
+        .unwrap();
+        let (cluster, co, run, tasks) = (cluster.clone(), co.clone(), run.clone(), tasks.clone());
+        old.write(move |tx|{
+            tx.execute("INSERT INTO cluster VALUES (?1,?2,1)",rusqlite::params![cluster.as_str(),co.as_str()])?;
+            tx.execute("INSERT INTO coordinator_state VALUES (1,?1,1)",[cluster.as_str()])?;
+            tx.execute("INSERT INTO run (run_id,spec_json,created_at_ms) VALUES (?1,'{}',1)",[run.as_str()])?;
+            for task in tasks {tx.execute("INSERT INTO task (task_id,run_id,spec_json,created_at_ms) VALUES (?1,?2,'{}',1)",rusqlite::params![task.as_str(),run.as_str()])?;}
+            Ok(())
+        }).unwrap();
+    }
+    let schema_info = |store: &CoordinatorStore| {
+        store
+            .db
+            .call(|c| {
+                Ok((
+                    c.query_row(
+                        "SELECT value FROM schema_meta WHERE key='schema_version'",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )?,
+                    c.query_row(
+                        "SELECT sql FROM sqlite_master WHERE name='task_run_key'",
+                        [],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?,
+                    c.query_row("SELECT count(*) FROM task", [], |r| r.get::<_, i64>(0))?,
+                ))
+            })
+            .unwrap()
+    };
+    {
+        let ro = CoordinatorStore::open_read_only(dir.path()).unwrap();
+        assert_eq!(schema_info(&ro), ("3".into(), None, 3));
+        assert_eq!(
+            ro.query_tasks(run.clone(), 64, None).unwrap().items.len(),
+            3
+        );
+        assert_eq!(schema_info(&ro), ("3".into(), None, 3));
+    }
+    let owner = CoordinatorStore::open(dir.path(), 2).unwrap();
+    let migrated = schema_info(&owner);
+    assert_eq!(migrated.0, "4");
+    assert_eq!(migrated.2, 3);
+    assert!(migrated.1.is_some());
+    let target_run = run.to_string();
+    let plan=owner.db.call(move |c|{
+        let mut q=c.prepare("EXPLAIN QUERY PLAN SELECT task_id FROM task WHERE run_id=?1 AND task_id>coalesce(NULL,'') ORDER BY task_id LIMIT 64")?;
+        let rows=q.query_map([target_run],|r|r.get::<_,String>(3))?.collect::<std::result::Result<Vec<_>,_>>()?;Ok(rows)
+    }).unwrap();
+    assert!(
+        plan.iter().any(|line| line.contains("task_run_key")),
+        "{plan:?}"
+    );
+    let fresh = tempfile::tempdir().unwrap();
+    let new = CoordinatorStore::open(fresh.path(), 1).unwrap();
+    assert_eq!(schema_info(&new).1, migrated.1);
+    assert_eq!(
+        owner.query_tasks(run, 64, None).unwrap().items.len(),
+        tasks.len()
+    );
 }

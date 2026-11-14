@@ -977,7 +977,28 @@ fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
             if meta.is_dir() {
                 stack.push(p);
             } else if meta.is_file() {
-                let bytes = std::fs::read(&p).unwrap_or_default();
+                let name = e.file_name();
+                let bytes = if matches!(
+                    name.to_str(),
+                    Some("worker.db" | "worker.db-wal" | "worker.db-shm")
+                ) {
+                    // A raw close in this process would release SQLite's POSIX
+                    // locks. A separate process preserves those locks and scans
+                    // all physical bytes, including WAL and deleted-row pages.
+                    let output = std::process::Command::new("/bin/cat")
+                        .arg(&p)
+                        .output()
+                        .unwrap();
+                    if output.status.success() {
+                        output.stdout
+                    } else if !p.exists() {
+                        Vec::new() // SQLite can retire a WAL/SHM between entries.
+                    } else {
+                        panic!("could not inspect SQLite file {}", p.display());
+                    }
+                } else {
+                    std::fs::read(&p).unwrap_or_default()
+                };
                 if bytes.windows(needle.len()).any(|w| w == needle) {
                     found.push(p);
                 }
@@ -1005,6 +1026,82 @@ async fn read_all(c: &Client, a: &AttemptId, stream: LogStream) -> Vec<u8> {
         panic!()
     };
     log.data.0
+}
+
+#[test]
+fn secret_scan_uses_an_isolated_reader_including_live_wal_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let worker = WorkerId::parse("snapshot-worker").unwrap();
+    let store = WorkerStore::open(dir.path(), &worker).unwrap();
+    // Put the schema in the main DB first. The following single event commit
+    // then stays below SQLite's automatic WAL checkpoint threshold.
+    let checkpoint = rusqlite::Connection::open(dir.path().join("worker.db")).unwrap();
+    checkpoint
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    drop(checkpoint);
+    let attempt = AttemptId::generate();
+    let marker = "synthetic-snapshot-marker-123456789";
+    store
+        .append_event(
+            None,
+            Some(&attempt),
+            "snapshot-check",
+            &serde_json::json!({"marker": marker}),
+            1,
+        )
+        .unwrap();
+    assert!(
+        std::fs::metadata(dir.path().join("worker.db-wal"))
+            .unwrap()
+            .len()
+            > 32
+    );
+    assert!(
+        files_holding(dir.path(), marker.as_bytes()).contains(&dir.path().join("worker.db-wal"))
+    );
+    let readonly = WorkerStore::open_read_only(dir.path()).unwrap();
+    assert_eq!(
+        readonly
+            .events_of(&attempt, "snapshot-check")
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(readonly);
+    let connection = rusqlite::Connection::open(dir.path().join("worker.db")).unwrap();
+    let deleted_marker = "synthetic-deleted-scan-marker-987654321";
+    connection
+        .execute_batch("CREATE TABLE physical_scan_probe(value TEXT)")
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO physical_scan_probe VALUES (?1)",
+            [deleted_marker],
+        )
+        .unwrap();
+    connection
+        .execute("DELETE FROM physical_scan_probe", [])
+        .unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM physical_scan_probe", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    // Logical deletion must not hide bytes still present in physical WAL pages.
+    assert!(files_holding(dir.path(), deleted_marker.as_bytes())
+        .contains(&dir.path().join("worker.db-wal")));
+    assert_eq!(
+        WorkerStore::open_read_only(dir.path())
+            .unwrap()
+            .events_of(&attempt, "snapshot-check")
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1059,8 +1156,31 @@ async fn a_secret_of_the_bundle_never_reaches_the_spool_the_journal_or_a_file_le
         files_holding(&f.state(), SECRET.as_bytes()).as_slice(),
         std::slice::from_ref(&spec)
     );
+    f.host.fail_cleanup.store(true, Ordering::SeqCst);
     std::fs::write(&go, "").unwrap();
     assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+
+    wait_for("the failed terminal cleanup", || {
+        events(&f, &a, "agent_cleanup_failed") == 1
+    });
+    assert!(f.host.ws_dir(&a).join(".env").exists());
+    assert!(
+        !spec.exists(),
+        "the masking spec goes even if host cleanup fails"
+    );
+    f.host.fail_cleanup.store(false, Ordering::SeqCst);
+    wait_for("supervise-only terminal cleanup", || {
+        agent.supervise();
+        !f.host.ws_dir(&a).exists() && !workspace_record(&f, &a).exists()
+    });
+    assert!(f.rec(&a).acked_at_ms.is_none());
+    assert!(f
+        .state()
+        .join("attempts")
+        .join(a.as_str())
+        .join("logs")
+        .exists());
+    let _retained_result = result_of(&c, &a).await;
 
     let out = String::from_utf8(read_all(&c, &a, LogStream::Stdout).await).unwrap();
     assert!(out.contains("API_TOKEN=***"), "{out}");
@@ -3660,4 +3780,83 @@ async fn the_real_host_prepares_a_setup_once_and_two_attempts_use_it() {
         std::fs::read_dir(state.join("workspaces")).map_or(true, |rd| rd.count() == 0)
     });
     assert!(f.supervisors_under(&state.join("setup")).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bounded_terminal_cleanup_progresses_and_retries_without_touching_running_work() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.fail_cleanup.store(true, Ordering::SeqCst);
+    let ended = AttemptId::generate();
+    submit(&c, &ended, &payload("true")).await;
+    assert_eq!(f.wait_terminal(&ended), Outcome::Succeeded);
+    wait_for("failed cleanup", || {
+        events(&f, &ended, "agent_cleanup_failed") == 1
+    });
+    f.host.secrets_ready.store(false, Ordering::SeqCst);
+    let running = AttemptId::generate();
+    submit(&c, &running, &payload("true")).await;
+    wait_for("running workspace", || {
+        workspace_record(&f, &running).exists()
+    });
+    let root = f.state().join("attempts");
+    for i in 0..40 {
+        std::fs::create_dir(root.join(format!("invalid-{i}"))).unwrap();
+    }
+    let before = f.host.count(&format!("cleanup {ended}"));
+    assert_eq!(agent.cleanup_terminal(0), 0);
+    assert_eq!(f.host.count(&format!("cleanup {ended}")), before);
+    let mut retried = false;
+    for _ in 0..100 {
+        assert!(agent.cleanup_terminal(1) <= 1);
+        retried |= f.host.count(&format!("cleanup {ended}")) > before;
+    }
+    assert!(
+        retried,
+        "a failed entry is visited again after the scan wraps"
+    );
+    f.host.fail_cleanup.store(false, Ordering::SeqCst);
+    for _ in 0..100 {
+        assert!(agent.cleanup_terminal(1) <= 1);
+        if !workspace_record(&f, &ended).exists() {
+            break;
+        }
+    }
+    assert!(!workspace_record(&f, &ended).exists());
+    assert!(!f.host.ws_dir(&ended).exists());
+    assert!(workspace_record(&f, &running).exists());
+    assert!(f.host.ws_dir(&running).exists());
+    assert_eq!(f.host.count(&format!("cleanup {running}")), 0);
+    // A cut-short spec write can remain without a workspace record. Removing
+    // the spec must not lose a failed host cleanup from subsequent passes.
+    let spec = root.join(ended.as_str()).join("supervise.json");
+    std::fs::write(&spec, b"leftover masking values").unwrap();
+    f.host.fail_cleanup.store(true, Ordering::SeqCst);
+    let before = f.host.count(&format!("cleanup {ended}"));
+    for _ in 0..100 {
+        assert!(agent.cleanup_terminal(1) <= 1);
+    }
+    assert!(!spec.exists());
+    assert!(f.host.count(&format!("cleanup {ended}")) > before + 1);
+    let pending = root.join(ended.as_str()).join("cleanup-pending");
+    assert!(pending.exists());
+    agent.shutdown();
+    let agent = f.start("boot-a");
+    let before_restart_retry = f.host.count(&format!("cleanup {ended}"));
+    for _ in 0..100 {
+        agent.cleanup_terminal(1);
+    }
+    assert!(f.host.count(&format!("cleanup {ended}")) > before_restart_retry);
+    f.host.fail_cleanup.store(false, Ordering::SeqCst);
+    for _ in 0..100 {
+        agent.cleanup_terminal(1);
+    }
+    assert!(!pending.exists());
+    let cleaned = f.host.count(&format!("cleanup {ended}"));
+    for _ in 0..100 {
+        agent.cleanup_terminal(1);
+    }
+    assert_eq!(f.host.count(&format!("cleanup {ended}")), cleaned);
+    assert!(f.rec(&ended).acked_at_ms.is_none());
 }

@@ -72,7 +72,8 @@ fn cfg(base: &Path) -> SetupConfig {
         PathBuf::from(BIN),
     );
     c.poll_ms = 25;
-    c.lease_ms = 3_000;
+    // These fixtures test setup sharing and cancellation, not lease expiry.
+    // Keep the production lease budget for independently scheduled supervisors.
     c.term_grace_ms = 1_000;
     c.kill_wait_ms = 2_000;
     c.deadline_ms = 120_000;

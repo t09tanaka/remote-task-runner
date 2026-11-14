@@ -23,6 +23,9 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 const KEY_BYTES: usize = 32;
+// Generating a key writes 65 bytes; retain support for larger existing keys,
+// but never allocate/read an unbounded owner-controlled file during startup.
+const MAX_KEY_FILE_BYTES: u64 = 4096;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClusterKey(Vec<u8>);
@@ -151,26 +154,42 @@ fn load_checked(path: &Path, state_in_use: bool) -> Result<ClusterKey> {
         }
     };
     let mut f = fs::File::from(fd);
+    load_opened(path, &mut f)
+}
+
+/// Validate and read the supplied descriptor without reopening its path.
+/// Bootstrap uses this after its stricter path-component checks.
+pub(crate) fn load_opened(path: &Path, f: &mut fs::File) -> Result<ClusterKey> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        check_dir(dir)?;
+    }
     let meta = f
         .metadata()
         .map_err(|e| SecretError::io(format!("cluster key {}", path.display()), e))?;
     if !meta.file_type().is_file()
+        || meta.nlink() != 1
         || meta.mode() & 0o077 != 0
         || meta.uid() != rustix::process::geteuid().as_raw()
     {
         return Err(refuse(path));
     }
     let mut text = String::new();
-    f.read_to_string(&mut text)
+    f.take(MAX_KEY_FILE_BYTES + 1)
+        .read_to_string(&mut text)
         .map_err(|e| SecretError::io(format!("cluster key {}", path.display()), e))?;
+    if text.len() as u64 > MAX_KEY_FILE_BYTES {
+        return Err(SecretError::Format(
+            "cluster key file exceeds 4096 bytes".into(),
+        ));
+    }
     ClusterKey::from_file_text(&text)
 }
 
 /// Make the cluster key at `path` (the explicit initialisation, run once when
 /// the cluster is set up) and return it; a key that is already there is
 /// checked and returned, never replaced. Two processes that race both end with
-/// the same key: the file is published with a hard link, which fails for the
-/// loser, who then reads the winner's. Loading never makes a key: see
+/// the same key: the file is published with an atomic no-replace rename,
+/// which fails for the loser, who then reads the winner's. Loading never makes a key: see
 /// [`load`].
 pub fn init(path: &Path) -> Result<ClusterKey> {
     match fs::symlink_metadata(path) {
@@ -193,7 +212,7 @@ pub fn init(path: &Path) -> Result<ClusterKey> {
         .create(dir)
         .map_err(|e| SecretError::io(format!("directory {}", dir.display()), e))?;
     check_dir(dir)?;
-    // a crash between the write and the link leaves a copy of a key behind
+    // a crash before publication leaves a temporary key copy behind
     sweep_stale_tmp(dir, STALE_TMP_AGE)?;
     let key = ClusterKey::generate()?;
     let tmp = dir.join(format!(".cluster-key.{}.tmp", ulid::Ulid::new()));
@@ -209,7 +228,16 @@ pub fn init(path: &Path) -> Result<ClusterKey> {
         .and_then(|()| f.sync_all());
     drop(f);
     let linked = wrote
-        .and_then(|()| fs::hard_link(&tmp, path))
+        .and_then(|()| {
+            rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                &tmp,
+                rustix::fs::CWD,
+                path,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(std::io::Error::from)
+        })
         .and_then(|()| sync_dir(dir));
     let _ = fs::remove_file(&tmp);
     match linked {
@@ -243,6 +271,59 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn key_read_is_bounded_including_sparse_files_and_size_boundary() {
+        use std::io::Seek;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("key");
+        init(&path).unwrap();
+        fs::write(&path, "ab".repeat(MAX_KEY_FILE_BYTES as usize / 2)).unwrap();
+        assert_eq!(
+            load(&path).unwrap().as_bytes().len(),
+            MAX_KEY_FILE_BYTES as usize / 2
+        );
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        assert!(load(&path).unwrap_err().to_string().contains("exceeds"));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(1 << 34).unwrap();
+        assert!(load_opened(&path, &mut file)
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds"));
+        assert_eq!(file.stream_position().unwrap(), MAX_KEY_FILE_BYTES + 1);
+    }
+
+    #[test]
+    fn opened_key_is_not_reopened_after_path_is_replaced_by_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("key");
+        let key = init(&path).unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        let original = d.path().join("original");
+        fs::rename(&path, &original).unwrap();
+        let other = d.path().join("other");
+        init(&other).unwrap();
+        fs::write(&other, "invalid").unwrap();
+        std::os::unix::fs::symlink(&other, &path).unwrap();
+        assert_eq!(load_opened(&path, &mut file).unwrap(), key);
+        assert!(matches!(load(&path), Err(SecretError::Insecure { .. })));
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(&original, &path).unwrap();
+        assert!(matches!(
+            load_opened(&original, &mut file),
+            Err(SecretError::Insecure { .. })
+        ));
     }
 
     #[test]

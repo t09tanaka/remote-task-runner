@@ -14,6 +14,7 @@
 
 mod common;
 mod coordinator;
+pub use coordinator::query;
 mod db;
 mod lock;
 pub mod policy;

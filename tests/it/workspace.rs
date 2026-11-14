@@ -1360,14 +1360,16 @@ fn a_hook_that_never_ends_is_killed_with_its_children() {
             pidfile.display()
         ),
     );
-    let fw = CliFastWorktree::with_timeout(env, std::time::Duration::from_secs(1));
+    // Allow the real shell and descendant to start under instrumented CI.
+    // The hook still cannot complete, so timeout and group cleanup are required.
+    let fw = CliFastWorktree::with_timeout(env, std::time::Duration::from_secs(10));
     let started = std::time::Instant::now();
     let e = fw.add(&f.dir, &f.root.join("d"), "b", "c").unwrap_err();
     assert!(started.elapsed().as_secs() < 30);
     let FwFailure::TimedOut { secs, stderr } = e else {
         panic!("{e:?}")
     };
-    assert_eq!(secs, 1);
+    assert_eq!(secs, 10);
     assert!(stderr.contains("starting"));
     let pid = std::fs::read_to_string(&pidfile)
         .unwrap()

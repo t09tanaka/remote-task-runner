@@ -1635,3 +1635,48 @@ fn paths_that_a_folding_file_system_merges_are_refused() {
         );
     }
 }
+
+#[test]
+fn source_upload_opens_verified_descriptors_without_links_or_whole_reads() {
+    use std::io::Seek;
+    let root = tempfile::tempdir().unwrap();
+    let store = SourceStore::open(root.path()).unwrap();
+    let bytes = vec![37; 3 * 64 * 1024 + 3];
+    let (hash, size) = store.object_store().put_bytes(&bytes).unwrap();
+    let mut upload = store.open_blob_verified(&hash).unwrap();
+    assert_eq!(upload.size, size);
+    assert_eq!(
+        upload.digest,
+        remote_task_runner::ids::Digest::of_bytes(&bytes)
+    );
+    assert_eq!(upload.file.stream_position().unwrap(), 0);
+    let mut prefix = [0; 7];
+    upload.file.read_exact(&mut prefix).unwrap();
+    assert_eq!(prefix, [37; 7]);
+    assert!(store.open_blob_verified("../escape").is_err());
+    let path = store.object_store().object_path(&hash);
+    std::fs::write(&path, vec![38; bytes.len()]).unwrap();
+    assert!(store.open_blob_verified(&hash).is_err());
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(root.path().join("outside"), &path).unwrap();
+    assert!(store.open_blob_verified(&hash).is_err());
+    std::fs::remove_file(&path).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+    std::fs::hard_link(&path, root.path().join("linked")).unwrap();
+    assert!(store.open_blob_verified(&hash).is_err());
+    let dir = store.root().join("bundles");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bundle = dir.join("fixture.bundle");
+    std::fs::write(&bundle, &bytes).unwrap();
+    let mut upload = store.open_bundle_verified(&bundle).unwrap();
+    assert_eq!(upload.size, bytes.len() as u64);
+    assert_eq!(upload.file.stream_position().unwrap(), 0);
+    assert!(store
+        .open_bundle_verified(&root.path().join("fixture.bundle"))
+        .is_err());
+    std::fs::remove_file(&bundle).unwrap();
+    std::os::unix::fs::symlink(&path, &bundle).unwrap();
+    assert!(store.open_bundle_verified(&bundle).is_err());
+    let (empty, _) = store.object_store().put_bytes(b"").unwrap();
+    assert_eq!(store.open_blob_verified(&empty).unwrap().size, 0);
+}

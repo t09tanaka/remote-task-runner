@@ -25,3 +25,5 @@ mod workspace;
 mod runtime;
 
 mod resident;
+
+mod bootstrap;

@@ -38,6 +38,7 @@ fn config() -> ResolvedConfig {
     c
 }
 fn inputs(root: &Path) -> Inputs {
+    remote_task_runner::secrets::key::init(&root.join("key")).unwrap();
     Inputs {
         state_dir: root.join("parent-state"),
         worker: WorkerInputs {

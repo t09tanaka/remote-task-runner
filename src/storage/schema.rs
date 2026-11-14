@@ -285,6 +285,7 @@ pub(crate) fn steps(kind: DbKind) -> Vec<String> {
             format!("{COMMON}{COORDINATOR_V1}"),
             COORDINATOR_V2.to_string(),
             COORDINATOR_V3.to_string(),
+            "CREATE INDEX task_run_key ON task(run_id, task_id);".to_string(),
         ],
         DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}")],
     }

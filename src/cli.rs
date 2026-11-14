@@ -21,6 +21,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run the parent owner process (internal).
+    #[command(hide = true)]
+    Daemon(DaemonArgs),
     /// Configure the coordinator and the local worker.
     Init,
     /// Run CI for the project.
@@ -30,9 +33,9 @@ pub enum Command {
     /// Submit a command without waiting.
     Submit(SubmitArgs),
     /// List runs and tasks.
-    Ls,
+    Ls(ListArgs),
     /// Show one run or task.
-    Show(IdArgs),
+    Show(ShowArgs),
     /// Show logs.
     Logs(LogsArgs),
     /// Wait for completion.
@@ -55,6 +58,13 @@ pub enum Command {
     /// Supervise one attempt as its own process (internal).
     #[command(hide = true)]
     Supervise(SuperviseArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonArgs {
+    /// Retained private service bootstrap input; absent means bounded stdin.
+    #[arg(long)]
+    pub input: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -95,6 +105,23 @@ pub struct ExecArgs {
 pub struct SubmitArgs {
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
+}
+
+/// Metadata listing, ordered by canonical identifier. Cursors are exclusive.
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    #[arg(long, default_value_t = 32)]
+    pub limit: u32,
+    #[arg(long)]
+    pub cursor: Option<String>,
+}
+#[derive(Debug, Args)]
+pub struct ShowArgs {
+    pub id: String,
+    #[arg(long, default_value_t = 32)]
+    pub limit: u32,
+    #[arg(long)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -203,6 +230,13 @@ impl Envelope {
 
 /// Run a parsed command and return the process exit code.
 pub fn run(cli: Cli) -> i32 {
+    if matches!(cli.command, Command::Ls(_) | Command::Show(_)) {
+        return run_query(&cli);
+    }
+
+    if let Command::Daemon(args) = &cli.command {
+        return crate::service::bootstrap::daemon_main(args.input.as_deref());
+    }
     if let Command::Worker(args) = &cli.command {
         if args.stdio && !args.ephemeral {
             return run_worker_stdio();
@@ -210,6 +244,52 @@ pub fn run(cli: Cli) -> i32 {
     }
     if let Command::Supervise(args) = &cli.command {
         return crate::supervisor::process::main(&args.spec);
+    }
+    if let Command::Submit(args) = &cli.command {
+        let result = (|| -> Result<crate::service::submit::Receipt, crate::error::ApiError> {
+            let env = std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                .collect();
+            let cwd = std::env::current_dir()
+                .map_err(|e| crate::error::ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+            let context = crate::service::context::Context::discover(env, cwd)?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| crate::error::ApiError::new(ErrorCode::Internal, e.to_string()))?;
+            runtime.block_on(crate::service::submit::command(
+                context,
+                args.command.clone(),
+                None,
+            ))
+        })();
+        return match result {
+            Ok(receipt) => {
+                for warning in &receipt.warnings {
+                    eprintln!("warning: {warning}");
+                }
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema_version":1,"ok":true,"result":receipt})
+                    );
+                } else {
+                    println!("{} {}", receipt.run_id, receipt.task_id);
+                }
+                exit::SUCCESS
+            }
+            Err(error) => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema_version":1,"ok":false,"error":error})
+                    );
+                } else {
+                    eprintln!("error: {}", error.message);
+                }
+                error.code.exit_code()
+            }
+        };
     }
     let envelope = Envelope::not_implemented();
     if cli.json {
@@ -278,6 +358,114 @@ pub fn main() -> i32 {
             };
             let _ = e.print();
             code
+        }
+    }
+}
+
+fn run_query(cli: &Cli) -> i32 {
+    use crate::error::ApiError;
+    use crate::service::query::Query;
+    let result = (|| -> Result<serde_json::Value, ApiError> {
+        // Validate limits and identifier syntax before touching runtime state.
+        let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
+        let (limit, cursor) = match &cli.command {
+            Command::Ls(a) => (a.limit, a.cursor.as_deref()),
+            Command::Show(a) => (a.limit, a.cursor.as_deref()),
+            _ => unreachable!(),
+        };
+        if limit == 0 || limit > 64 {
+            return Err(invalid("limit must be 1..64".into()));
+        }
+        match &cli.command {
+            Command::Ls(_) => {
+                cursor
+                    .map(crate::ids::RunId::parse)
+                    .transpose()
+                    .map_err(|e| invalid(e.to_string()))?;
+            }
+            Command::Show(a) => {
+                if a.id.starts_with("run_") {
+                    crate::ids::RunId::parse(&a.id).map_err(|e| invalid(e.to_string()))?;
+                    cursor
+                        .map(crate::ids::TaskId::parse)
+                        .transpose()
+                        .map_err(|e| invalid(e.to_string()))?;
+                } else if a.id.starts_with("task_") {
+                    crate::ids::TaskId::parse(&a.id).map_err(|e| invalid(e.to_string()))?;
+                    cursor
+                        .map(str::parse::<u64>)
+                        .transpose()
+                        .map_err(|e| invalid(e.to_string()))?;
+                } else {
+                    return Err(invalid("expected run_ or task_ identifier".into()));
+                }
+            }
+            _ => unreachable!(),
+        }
+        let env = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        let cwd = std::env::current_dir().map_err(|e| invalid(e.to_string()))?;
+        let context = crate::service::context::Context::discover(env, cwd)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+        runtime.block_on(async {
+            let client = context
+                .readonly()
+                .await
+                .map_err(|e| ApiError::new(e.code, e.to_string()))?;
+            let value = match &cli.command {
+                Command::Ls(_) => serde_json::to_value(
+                    client
+                        .query(Query::Runs {
+                            limit,
+                            after: cursor
+                                .map(crate::ids::RunId::parse)
+                                .transpose()
+                                .map_err(|e| invalid(e.to_string()))?,
+                        })
+                        .await
+                        .map_err(|e| ApiError::new(e.code, e.to_string()))?,
+                ),
+                Command::Show(a) => serde_json::to_value(
+                    client
+                        .show(&a.id, limit, cursor)
+                        .await
+                        .map_err(|e| ApiError::new(e.code, e.to_string()))?,
+                ),
+                _ => unreachable!(),
+            }
+            .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+            Ok(value)
+        })
+    })();
+    match result {
+        Ok(value) => {
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":true,"data":value})
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).expect("query serializes")
+                );
+            }
+            0
+        }
+        Err(error) => {
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":false,"error":error})
+                );
+            } else {
+                eprintln!("error: {}", error.message);
+            }
+            error.code.exit_code()
         }
     }
 }
